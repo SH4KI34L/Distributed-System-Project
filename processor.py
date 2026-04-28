@@ -3,91 +3,117 @@ import redis
 import pandas as pd
 from prophet import Prophet
 from confluent_kafka import Consumer
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+from influxdb_client import InfluxDBClient, Point, WritePrecision
+from influxdb_client.client.write_api import SYNCHRONOUS
+import logging
+import time
 
-# 1. SETUP: Connectivity Configuration
+# Silence background Prophet logs
+logging.getLogger('cmdstanpy').setLevel(logging.ERROR)
+
+# --- CONFIGURATION (UPDATE THESE) ---
+INFLUX_CONF = {
+    "url": "http://localhost:8086",
+    "token": "XjEoEBACxG15ZIkgrr3QAbHTkXjXb8bYUq3mjNpCNjzUYkV8u4rurEowA3tpeCWKAQLNnRPPGfBtx2VdQ15tIQ==", # Get from InfluxDB UI
+    "org": "Loadlink",
+    "bucket": "loadlink_traffic"
+}
+
+# New Group ID to ensure we start reading fresh data
 KAFKA_CONF = {
-    'bootstrap.servers': 'localhost:9092',
-    'group.id': 'loadlink-prediction-group',
+    'bootstrap.servers': 'localhost:9092', 
+    'group.id': 'loadlink-final-demo-group-01',
     'auto.offset.reset': 'earliest'
 }
 
+# --- CLIENT INITIALIZATION ---
 r = redis.Redis(host='localhost', port=6379, decode_responses=True)
+influx_client = InfluxDBClient(url=INFLUX_CONF["url"], token=INFLUX_CONF["token"], org=INFLUX_CONF["org"])
+write_api = influx_client.write_api(write_options=SYNCHRONOUS)
 
-# 2. DATA STORAGE: Temporary list to hold history for Prophet
-# Prophet needs historical data to "learn" the trend
-traffic_history = [] 
-MIN_DATA_POINTS = 10 # Minimum points needed before we start predicting
+branch_histories = {}
+MIN_DATA_POINTS = 10
 
 def run_forecast(history):
     """
-    Passes historical data to Facebook Prophet to predict the next value.
+    Fits a Prophet model to the branch history and predicts the next hour.
     """
     df = pd.DataFrame(history)
-    # Prophet strictly requires columns named 'ds' (datestamp) and 'y' (value)
-    df.columns = ['ds', 'y']
     df['ds'] = pd.to_datetime(df['ds'])
-
-    # Initialize and fit the model
-    # suppress_stdout_stderr is used here to keep your terminal clean
-    model = Prophet(interval_width=0.95, daily_seasonality=True)
-    model.fit(df)
-
-    # Predict 1 step into the future
-    future = model.make_future_dataframe(periods=1, freq='H')
-    forecast = model.predict(future)
     
-    predicted_val = forecast['yhat'].iloc[-1]
-    return round(predicted_val, 2)
+    # Normalize timeline: 10 mins apart per data point for model stability
+    start_time = datetime.now()
+    df['ds'] = [start_time + timedelta(minutes=10*i) for i in range(len(df))]
+    
+    # Flat growth is best for stable, realistic café predictions
+    model = Prophet(
+        growth='flat', 
+        daily_seasonality=False, 
+        weekly_seasonality=False, 
+        yearly_seasonality=False
+    )
+    model.fit(df)
+    
+    future = model.make_future_dataframe(periods=1, freq='h')
+    forecast = model.predict(future)
+    return int(max(0, forecast['yhat'].iloc[-1]))
 
-# 3. KAFKA: Initialize Consumer
+# --- MAIN CONSUMER LOOP ---
 consumer = Consumer(KAFKA_CONF)
-topics = ['loadlink.traffic.raw'] # Focusing on traffic for Prophet
-consumer.subscribe(topics)
+consumer.subscribe(['loadlink.traffic.raw'])
 
-print(f"--- Loadlink Forecasting Active: Waiting for {MIN_DATA_POINTS} data points ---")
+print(f"--- Loadlink System: AI + InfluxDB Persistence Active ---")
 
 try:
     while True:
-        msg = consumer.poll(1.0)
-        
+        msg = consumer.poll(1.0) # Listen for 1 second
         if msg is None: continue
         if msg.error():
             print(f"Consumer Error: {msg.error()}")
             continue
 
         try:
+            # Decode message
             data = json.loads(msg.value().decode('utf-8'))
-            cafe_id = data.get('cafe_id', 'Unknown_Cafe')
-            current_count = data['metrics']['current_traffic']
+            b_id = data.get('branch_id', 'Unknown')
+            count = data['metrics']['current_traffic']
             
-            # Prophet needs a timestamp. If ingestion doesn't send one, we create it.
-            timestamp = data['metrics'].get('timestamp', datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+            # 1. Manage history per branch to avoid data leakage
+            if b_id not in branch_histories:
+                branch_histories[b_id] = []
             
-            # Append to history: [Timestamp, Value]
-            traffic_history.append({'ds': timestamp, 'y': current_count})
+            branch_histories[b_id].append({'ds': datetime.now(), 'y': count})
             
-            # Keep the history manageable (e.g., last 100 points)
-            if len(traffic_history) > 100:
-                traffic_history.pop(0)
+            # Keep a sliding window of the last 20 points
+            if len(branch_histories[b_id]) > 20:
+                branch_histories[b_id].pop(0)
 
-            print(f"Data Collected: {current_count} users at {timestamp}")
+            # 2. Run Prediction if we have enough data
+            prediction = 0
+            if len(branch_histories[b_id]) >= MIN_DATA_POINTS:
+                prediction = run_forecast(branch_histories[b_id])
+                # Save to Redis for real-time dashboarding
+                r.set(f"cafe:prediction:{b_id}", prediction)
 
-            # 4. PREDICTION LOGIC
-            if len(traffic_history) >= MIN_DATA_POINTS:
-                prediction = run_forecast(traffic_history)
-                
-                # Save prediction to Redis for the Frontend Lead
-                redis_key = f"cafe:prediction:{cafe_id}"
-                r.set(redis_key, prediction)
-                
-                print(f">>> PROPHET FORECAST for {cafe_id}: {prediction} expected users next hour.")
+            # 3. Save to InfluxDB for historical auditing
+            point = Point("traffic_stats") \
+                .tag("branch", b_id) \
+                .field("actual", float(count)) \
+                .field("forecast", float(prediction)) \
+                .time(datetime.now(timezone.utc), WritePrecision.NS)
+            
+            write_api.write(bucket=INFLUX_CONF["bucket"], org=INFLUX_CONF["org"], record=point)
+            
+            # Success Log
+            status = "🔮 Predicting..." if prediction > 0 else "⏳ Collecting..."
+            print(f"[{b_id}] Actual: {count} | Forecast: {prediction} | {status}")
 
         except Exception as e:
-            print(f"Processing Error: {e}")
+            print(f"Loop Error: {e}")
             continue
 
 except KeyboardInterrupt:
-    print("\nStopping Prophet Processor...")
+    print("\nShutting down Loadlink Processor...")
 finally:
     consumer.close()
